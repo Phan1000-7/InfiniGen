@@ -400,7 +400,7 @@ class TorchDevice:
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, acc, donate,
                 attn_sparsity, compress_cache, comp_config,
                 hh_k=None, hh_all=False):
-        """Multi-head attention (decoding phase)."""
+        """Multi-head attention (decoding phase)."""    # mha_gen会把当前decode计算的注意力权重更新acc（对每个已缓存的词元都记录了它到目前为止被关注的总程度）
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
             w_q = w_q.device.decompress(w_q)
@@ -419,7 +419,7 @@ class TorchDevice:
         q = F.linear(hidden, w_q.data, bias=b_q.data) * scaling
         k = F.linear(hidden, w_k.data, bias=b_k.data)
         v = F.linear(hidden, w_v.data, bias=b_v.data)
-        # shape: (b, 1, n_head, head_dim)
+        # shape: (b, 1, n_head, head_dim)  多头切割
         q = q.view(b, tgt_s, n_head, head_dim)
         k = k.view(b, tgt_s, n_head, head_dim)
         v = v.view(b, tgt_s, n_head, head_dim)
@@ -517,8 +517,8 @@ class TorchDevice:
             k_new = TorchTensor.create_from_torch(k_new, self)
             v_new = TorchTensor.create_from_torch(v_new, self)
 
-        # get the least heavy hitter (except recent tokens)
-        kick_ind = None
+        # get the least heavy hitter (except recent tokens)   基于更新后的累积注意力分数 acc，找到当前HH集合中得分最低的token的索引
+        kick_ind = None   # 初始化要被踢出的索引为 None
         if hh_all:
             # k shape: (b * n_head, head_dim, s)
             # v shape: (b * n_head, s, head_dim)
@@ -527,9 +527,14 @@ class TorchDevice:
             attn_weights = attn_weights.squeeze(1).transpose(0, 1)
             # (s, b * n_head)
             acc.data = acc.data.cuda()
+            # 因为 acc 存储的是历史词元作为Key时“被关注”的总分数，新词元刚加入，其作为历史Key被关注的累积是0
             acc.data[-1] = 0
+            # 将当前步骤计算出的、每个历史词元被关注的程度 (attn_weights_reshaped) 加到对应的累积注意力分数上
             acc.data = acc.data + attn_weights
             # print("acc.data", acc.data.shape, acc.data[:, -4])
+            # src_s 是当前KV缓存的总长度 (例如，prompt_len + i)    hh_k 是H2O策略中设定的local窗口大小 (也是hh窗口大小)
+            # 查看的是除了最近 hh_k 个 token 之外的所有 token 的累积注意力分数
+            # 这个 hh_k（代码中注释指的 H2O 策略中设定的 local 窗口大小，也是 hh 窗口大小）充当一个“近期窗口”——此窗口内的 token 受到保护，不会被逐出
             kick_ind = self._get_light_hitter(acc.data[:src_s - hh_k, :])
             if not k.is_cuda:
                 acc.data = acc.data.float().cpu()

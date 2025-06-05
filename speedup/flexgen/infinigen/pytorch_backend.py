@@ -162,7 +162,7 @@ class TorchTensor:
 
 class TorchDevice:
     """Wrap tensor and computation APIs of a single CPU or GPU."""
-
+    # 具体层内计算算子的定义
     def __init__(self, name, mem_capacity=None, flops=None):
         self.name = name
         self.mem_capacity = mem_capacity
@@ -292,6 +292,7 @@ class TorchDevice:
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,
             policy.gpu_batch_size)
+        # 创建固定size的KV Cache
         shape = (prompt_len + gen_len - 1, gpu_batch_size * num_head, hidden_size // num_head)
         # NOTE: disable pin_memory due to high memory overhead
         pin_memory = False
@@ -334,7 +335,7 @@ class TorchDevice:
         if warmup:
             w_q.data, w_k.data = skew(q, k, w_q.data, w_k.data, n_head, head_dim)
 
-        # shape: (b * n_head, s, head_dim)
+        # shape: (b * n_head, s, head_dim)       premute维度转换 -> 适合进行批量矩阵乘法（torch.bmm）的形状
         q = q.permute(0, 2, 1, 3).reshape(b * n_head, s, head_dim)
         # shape: (b * n_head, head_dim, s)
         k = k.permute(0, 2, 3, 1).reshape(b * n_head, head_dim, s)
@@ -344,14 +345,14 @@ class TorchDevice:
         # shape: (b * n_head, s, s)
         attn_weights = torch.bmm(q, k)
 
-        # shape: (b, 1, s, s)
+        # shape: (b, 1, s, s)  构建下三角的掩码
         idx = torch.arange(s, device=self.dev)
         causal_mask = (idx <= idx.view(s, 1)).view(1, 1, s, s)
         mask = attention_mask.data.view(b, 1, 1, s) & causal_mask
 
         # shape: (b, n_head, s, s)
         attn_weights = attn_weights.view(b, n_head, s, s)
-        attn_weights = torch.where(mask, attn_weights, -1e4)
+        attn_weights = torch.where(mask, attn_weights, -1e4)  # where函数 mask为true才取attn_weights
         attn_weights = attn_weights.view(b * n_head, s, s)
         attn_weights = F.softmax(attn_weights, dim=2)
         # shape: (b, n_head, s, head_dim)
@@ -685,7 +686,8 @@ class TorchDisk:
     def delete(self, tensor):
         if os.path.exists(tensor.data) and tensor.delete_file:
             os.remove(tensor.data)
-
+    
+    # 就是flex_gen 注意力模块中KV cache的初始化分配空间
     def init_cache_one_gpu_batch(self, config, task, policy):
         num_head, hidden_size, prompt_len, gen_len, gpu_batch_size = (
             config.n_head, config.input_dim, task.prompt_len, task.gen_len,

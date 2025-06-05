@@ -24,14 +24,14 @@ def select_kv(prefetch_idx, k_cache, v_cache):
     selected_v = F.embedding(ind, v_cache.reshape(-1, v_cache.shape[2]))
     return selected_k, selected_v
 
-
+# 返回的重要 token 索引  通过从推测的最高注意力分数中减去 alpha 来选择 tokens
 def speculate_attention(hidden, p_w_q, p_k_c, n_head, alpha, max_num_kv):
     """Speculates the indices of the critical KV caches of next attention layer.
 
     On the decoding stage, by using the hidden states (layer i), partial query
     weight (layer i+1), and partial key cache (layer i+1), speculates the
     attention score of the next layer. After that, counts the number of
-    critical tokens and gets the indcies of the top-k KV cache tokens with high
+    critical tokens and gets the indices of the top-k KV cache tokens with high
     attention scores.
 
     Args:
@@ -59,5 +59,6 @@ def speculate_attention(hidden, p_w_q, p_k_c, n_head, alpha, max_num_kv):
     prefetch_idx = torch.topk(
         p_attn.permute(2, 1, 0), min(int(mean), max_num_kv), dim=0
     )[1]
+    print(f"Speculated prefetch idx: {prefetch_idx}")
 
     return prefetch_idx

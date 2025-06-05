@@ -1,0 +1,32 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "Debug",
+            "type": "debugpy",
+            "request": "launch",
+            //"program": "/home/szshen/LLM_sparse/InfiniGen/speedup/flexgen/h2o/flex_opt.py",
+            "program":"/home/szshen/LLM_sparse/InfiniGen/speedup/flexgen/flexgen/flex_opt.py",
+            "python": "${command:python.interpreterPath}",
+            "console": "integratedTerminal",
+            "args": [
+                "--model", "facebook/opt-1.3b",
+                "--gpu-batch-size", "1",    // 单批次推理
+                "--num-gpu-batches", "1",
+                "--percent", "100", "0", "0", "100", "100", "0",
+                // W、KV、A 的 GPU、CPU 占比
+                "--overlap", "false",
+                "--prompt-len", "128",
+                "--gen-len", "128",
+                "--warmup-input-path", "/home/szshen/LLM_sparse/InfiniGen/speedup/flexgen/pg19_firstbook.txt",
+                "--test-input-path", "/home/szshen/LLM_sparse/InfiniGen/speedup/flexgen/pg19_firstbook.txt",
+                // "--hh-ratio", "0.1",
+                // "--hh-all"
+                "--alpha", "4",
+                "--partial-weight-ratio", "0.2",
+                "--max-num-kv", "102"
+            ]
+        }
+    ]
+}

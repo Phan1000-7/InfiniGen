@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 
 from flexgen.compression import CompressionConfig
 from flexgen.opt_config import OptConfig, get_opt_config, download_opt_weights
-from flexgen.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchTensor,
+from h2o.pytorch_backend import (TorchDevice, TorchDisk, TorchLink, TorchTensor,
     TorchMixedDevice, DeviceType, general_copy, fix_recursive_import,
     cache_replace, acc_replace)
 from flexgen.timer import timers
@@ -493,7 +493,7 @@ class SelfAttention:
                 self.policy.compress_cache, self.policy.comp_cache_config,
                 self.hh_k, self.policy.hh_all)
             cache_write_buf.store((new_k_cache, new_v_cache, acc, None))
-        else:  # decoding
+        else:  # decoding阶段  首先motivation把每个token的softmax(QK)打印
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]), (acc, _) = cache_read_buf.pop()
             if self.policy.hh_all is not None:
@@ -1339,12 +1339,15 @@ def run_flexgen(args):
     print("input: " + str(prompt_len) + " output: " + str(gen_len) + " bsz: " + str(num_prompts))
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
     print("Total: " + str(total_latency) + " Prefill: " + str(prefill_latency) + " Decode: " + str(decode_latency))
+    print("Throughput: " + str(total_throughput) + " Prefill: " + str(prefill_throughput) + " Decode: " + str(decode_throughput))
+    print("Peak GPU Memory: " + str(gpu_peak_mem))
+    print("Peak CPU Memory: " + str(cpu_peak_mem))
     print("=================================================")
 
 def add_parser_arguments(parser):
-    parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
+    parser.add_argument("--model", type=str, default="facebook/opt-1.3b",
         help="The model name.")
-    parser.add_argument("--path", type=str, default="~/opt_weights",
+    parser.add_argument("--path", type=str, default="/mnt/sdb/llm_models/opt-1.3b",
         help="The path to the model weights. If there are no cached weights, "
              "FlexGen will automatically download them from HuggingFace.")
     parser.add_argument("--offload-dir", type=str, default="~/flexgen_offload_dir",
@@ -1355,10 +1358,10 @@ def add_parser_arguments(parser):
         help="Cut generation length for fast debugging.")
     parser.add_argument("--debug-mode", type=str,
         choices=["fewer_batch", "breakdown"])
-    parser.add_argument("--gpu-batch-size", type=int, default=4)
+    parser.add_argument("--gpu-batch-size", type=int, default=1)
     parser.add_argument("--num-gpu-batches", type=int, default=1)
     parser.add_argument("--percent", nargs="+", type=int,
-        default=[100, 0, 100, 0, 100, 0],
+        default=[0, 0, 100, 0, 100, 0],
         help="Six numbers. They are "
          "the percentage of weight on GPU, "
          "the percentage of weight on CPU, "
@@ -1382,14 +1385,14 @@ def add_parser_arguments(parser):
                         help="ratio of the prompt seq length")
     parser.add_argument("--hh-all", type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument("--hh-long-seq", type=str2bool, nargs='?', const=True, default=False)
-    parser.add_argument("--max-num-kv", type=int, default=415)
+    parser.add_argument("--max-num-kv", type=int, default=400)
 
     parser.add_argument("--log-file", type=str, default="auto")
     parser.add_argument("--no-log", action="store_true")
     parser.add_argument("--verbose", type=int, default=2)
 
     parser.add_argument("--overlap", type=str2bool, nargs='?',
-        const=True, default=True)
+        const=True, default=False)
 
     parser.add_argument("--warmup-input-path", type=str)
     parser.add_argument("--test-input-path", type=str)

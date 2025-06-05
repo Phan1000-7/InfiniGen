@@ -1,6 +1,6 @@
 """
 Usage:
-python3 -m flexgen.flex_opt --model facebook/opt-1.3b --gpu-batch-size 32 --percent 100 0 100 0 100 0
+python3 -m flexgen.flex_opt --model facebook/opt-1.3b --gpu-batch-size 32 --percent 100 0 100 0 100 0   weight/KV cache/activation on GPU/CPU
 """
 
 import argparse
@@ -32,7 +32,6 @@ from infinigen.partial_weight_generation_controller import set_partial_cache, se
 fix_recursive_import()
 
 DUMMY_WEIGHT = "_DUMMY_"  # Use dummy weights for benchmark purposes
-
 
 @dataclasses.dataclass(frozen=True)
 class Policy:
@@ -82,7 +81,7 @@ class Policy:
     def act_disk_percent(self):
         return 100 - self.act_gpu_percent - self.act_cpu_percent
 
-
+## 用来根据计算出来的权重“位置百分比”，决定这个权重应该由哪个设备（磁盘、CPU、GPU）来“认领”和存储
 def get_choice(cur_percent, percents, choices):
     percents = np.cumsum(percents)
     assert np.abs(percents[-1] - 100) < 1e-5
@@ -92,19 +91,20 @@ def get_choice(cur_percent, percents, choices):
             return choices[i]
     return choices[-1]
 
-
+## 把模型的每一层的每个权重放进这个列表 weight_spec 里然后遍历来决定存放位置  (shape, dtype, filename)
 def init_weight_list(weight_specs, policy, env):
     dev_percents = [policy.w_disk_percent, policy.w_cpu_percent, policy.w_gpu_percent]
     dev_choices = [env.disk, env.cpu, env.gpu]
-
+    ## 计算权重元素个数
     sizes = [np.prod(spec[0]) for spec in weight_specs]
+    ## 计算权重元素个数的前缀和     对于一个输入列表 [s1, s2, s3, ..., sn]，np.cumsum() 会返回一个新的列表 [s1, s1+s2, s1+s2+s3, ..., s1+s2+...+sn]
     sizes_cumsum = np.cumsum(sizes)
     ret = []
     for i in range(len(weight_specs)):
         mid_percent = (sizes_cumsum[i] - sizes[i] / 2) / sizes_cumsum[-1]
         home = get_choice(mid_percent * 100, dev_percents, dev_choices)
         shape, dtype, filename = weight_specs[i]
-
+        
         if len(shape) < 2:
             pin_memory = True
             compress = False
@@ -130,17 +130,17 @@ def init_weight_list(weight_specs, policy, env):
                 for i in range(2):
                     x = weight.data[i]
                     x.load_from_np(np.ones(x.shape, torch_dtype_to_np_dtype[x.dtype]))
-
+        # 返回处理好的，包括存放位置、压缩、具体数据
         ret.append(weight)
     return ret
 
-
+# 分层来分配权重等，里面的权重分配函数还是调用全局的
 class InputEmbed:
     def __init__(self, config, env, policy):
-        self.config = config
-        self.env = env
-        self.policy = policy
-        self.compute = self.env.gpu
+        self.config = config # 存储模型配置对象 (e.g., vocab_size, input_dim)
+        self.env = env       # 存储执行环境对象 (e.g., GPU, CPU, Disk)
+        self.policy = policy # 存储策略对象 (e.g., 权重存放位置、压缩、pin mem)
+        self.compute = self.env.gpu  # TorchDevice 
         self.weight_load_dst = (self.compute.compressed_device if policy.compress_weight
             else self.compute)
 
@@ -149,6 +149,7 @@ class InputEmbed:
     def set_task(self, task):
         self.task = task
 
+    # input_embed 包括 token embedding 和 position embedding  init_weight 里会把这两个权重都放进 weight_home 里
     def init_weight(self, weight_home, path):
         v, h, s, dtype = (self.config.vocab_size, self.config.input_dim,
             self.config.max_seq_len, self.config.dtype)
@@ -160,15 +161,17 @@ class InputEmbed:
             ((s + 2, h), dtype, path + "decoder.embed_positions.weight"),
         ]
         weights = init_weight_list(weight_specs, self.policy, self.env)
-
+        # home存处理好的权重
         weight_home.store(weights)
-
+        
+    # 前向传播前把权重载入
     def load_weight(self, weight_home, weight_read_buf, k):
         w_token, w_pos = weight_home.val
-        if k == 0:
+        if k == 0:  
             dst = self.weight_load_dst
             weight_read_buf.store((w_token.smart_copy(dst), w_pos.smart_copy(dst)))
 
+    # 嵌入层没KV缓存
     def init_cache_one_gpu_batch(self, cache_home):
         pass  # do nothing
 
@@ -198,7 +201,7 @@ class InputEmbed:
             w_token, w_pos, self.config.pad_token_id, donate)
         hidden.val = h
 
-
+## 最后输出层  RMSNorm + Linear
 class OutputEmbed:
     def __init__(self, config, env, policy):
         self.config = config
@@ -288,6 +291,8 @@ class SelfAttention:
             self.partial_weight_ratio = partial_weight_ratio
         else:
             self.partial_weight_ratio = None
+            
+        self.decode_len = 0
 
     def set_task(self, task):
         self.task = task
@@ -332,8 +337,14 @@ class SelfAttention:
     def load_weight(self, weight_home, weight_read_buf, k):
         w_q, b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln = weight_home.val
         if k == 0:
+            #    dst1适用于较大权重矩阵可能从压缩策略受益；dst2即普通GPU
             dst1 = self.weight_load_dst
             dst2 = self.compute
+            #    "智能复制" 所有权重到各自的目标设备，并存储到读取缓冲区
+            #    对每个权重调用 .smart_copy(target_device) 将其转移到目标GPU设备上。
+            #    smart_copy 会处理数据源（磁盘/CPU）、压缩/解压缩（如果适用）以及设备间传输。
+            #    处理后的权重（现在位于GPU上）会被打包成一个元组，并存储到 weight_read_buf 中。
+            #    后续的 forward 方法将从这个 weight_read_buf 中获取这些GPU上的权重进行计算。
             weight_read_buf.store((
                 w_q.smart_copy(dst1), b_q.smart_copy(dst2),
                 w_k.smart_copy(dst1), b_k.smart_copy(dst2),
@@ -341,7 +352,7 @@ class SelfAttention:
                 w_out.smart_copy(dst1), b_out.smart_copy(dst2),
                 w_ln.smart_copy(dst2), b_ln.smart_copy(dst2)))
 
-    def init_cache_one_gpu_batch(self, cache_home):
+    def init_cache_one_gpu_batch(self, cache_home):                 # 初始化KV Cache只在注意力层进行
         if self.policy.cache_gpu_percent == 100:
             device = self.env.gpu
         elif self.policy.cache_cpu_percent == 100:
@@ -356,14 +367,17 @@ class SelfAttention:
             device = device.compressed_device
 
         cache = device.init_cache_one_gpu_batch(self.config, self.task, self.policy)
+        #  cache_home.val 返回一个包含Key缓存 (k_home) 和 Value缓存 (v_home) 的元组，这里创建固定size的KV Cache（prompt_len + gen_len - 1），每个注意力层都有
+        #  由于policy指定了KV Cache的存储位置，所以cache_home里就包含具体存储位置上的KV Cache
         cache_home.store(cache)
         if self.layer_id > 1:
             self.prefetch_kv = device.allocate((2, self.max_num_kv, cache_home.val[0].shape[1], cache_home.val[0].shape[2]), np.float16, pin_memory=True)
 
+    # 从存储位置载入到计算位置
     def load_cache(self, cache_home, cache_read_buf, i):
         if i == 0:  # prefill, no cache
             return
-
+        # k、v是TorchTensor的类型，知道自己在哪个设备上
         k_home, v_home = cache_home.val
 
         # Pick code path
@@ -381,22 +395,26 @@ class SelfAttention:
                 path = 0
             dst = self.attention_compute
 
+        # 直接拷贝 smart_copy 会将K和V（如果需要）从它们的k_home/v_home 位置（可能是CPU或磁盘）直接拷贝到GPU
         if path == 0:  # Direct copy
             # shape: (s, b * n_head, head_dim)
+            # 计算需要载入的KV的范围
             indices = (slice(0, self.task.prompt_len + i),
                        slice(0, k_home.shape[1]))
 
+            # dst是计算的目标设备，smart_copy从存储的地方载入到计算的dst
             if self.policy.attn_sparsity >= 1.0:
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     v_home.smart_copy(dst, indices),
                 ))
             else:
+                # 针对稀疏注意力的优化   V直接取索引
                 cache_read_buf.store((
                     k_home.smart_copy(dst, indices),
                     (v_home, False),
                 ))
-        elif path == 1:  # Copy to CPU temporary workspace
+        elif path == 1:  # Copy to CPU temporary workspace 注意力计算在CPU上进行  dst = CPU
             # shape: (s, b * n_head, head_dim)
             k_buf, v_buf = dst.next_attention_compute_workspace()
             indices = (slice(0, self.task.prompt_len + i - 1),
@@ -468,6 +486,9 @@ class SelfAttention:
         else:    
             raise ValueError(f"Invalid path: {path}")
 
+    # 从 cache_write_buf（一个临时的、通常在GPU上的写入缓冲区）中取出本轮计算新产生的K和V数据（k_new, v_new）
+    # 确定这些新数据应该被写回到长期KV缓存（k_home, v_home）的哪个位置（indices）
+    # 使用 general_copy 函数将这些新数据从它们当前的位置（如GPU）拷贝到长期存储位置（可能是CPU、磁盘或GPU本身，取决于k_home/v_home的实际设备）
     def store_cache(self, cache_home, cache_write_buf, i):
         # shape: (s, b * n_head, head_dim)
         k_home, v_home = cache_home.val
@@ -515,6 +536,8 @@ class SelfAttention:
             h, new_k_cache, new_v_cache, w_q, w_k, self.partial_index = self.compute.mha(h, mask, w_q, b_q,
                 w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head, donate,
                 self.policy.compress_cache, self.policy.comp_cache_config, warmup, self.partial_weight_ratio)
+            # 在解码时从 cache_read_buf 读取历史KV
+            # 将新生成的KV（完整或增量）存入 cache_write_buf，以便后续由 store_cache 方法持久化
             cache_write_buf.store((new_k_cache, new_v_cache))
             if (prev_partial_cache_read_buf is not None) and (not warmup):
                 prev_partial_cache_read_buf.store(set_partial_cache(new_k_cache.data, self.partial_index, n_head, head_dim))
@@ -525,6 +548,8 @@ class SelfAttention:
         else:  # decoding
             mask, donate[1] = attention_mask.val.smart_copy(self.attention_compute)
             (k_cache, donate[12]), (v_cache, donate[13]) = cache_read_buf.pop()
+            self.decode_len += 1
+            print(self.decode_len)
             if self.enable_prefetching:
                 partial_k_cache = partial_cache_read_buf.val
             if self.enable_prefetching:
@@ -613,7 +638,7 @@ class MLP:
         else:
             ((wi, _), (bi, _), (wo, _), (bo, _),
              (w_ln, _), (b_ln, _)) = weight_read_buf.val
-
+        # 具体计算函数全在pytorch_backend里
         h = self.compute.mlp(h, wi, bi, wo, bo, w_ln, b_ln, donate)
         hidden.val = h
 
@@ -699,7 +724,7 @@ class OptLM:
         layers.append(OutputEmbed(self.config, self.env, self.policy))
         self.layers = layers
         self.num_layers = len(layers)
-
+        # 中间激活只放一个地方
         if self.policy.act_gpu_percent == 100:
             self.act_home = self.env.gpu
         elif self.policy.act_cpu_percent == 100:
@@ -735,7 +760,7 @@ class OptLM:
         self.partial_weight_read_buf = array_1d(num_layers, ValueHolder)
         # attention_mask[k]
         self.attention_mask = array_1d(num_gpu_batches, ValueHolder)
-
+        # 初始化所有权重到指定位置
         self.task = None
         self.init_all_weights()
 
@@ -754,7 +779,7 @@ class OptLM:
         self.layers[j].init_weight(self.weight_home[j], expanded_path)
 
     def load_weight(self, i, j, k, overlap=True):
-        # Handle corner cases
+        # Handle corner cases 处理下一个词元了
         if j == self.num_layers:
             j = 0
             i += 1
@@ -936,19 +961,19 @@ class OptLM:
     def init_all_weights(self):
         self.weight_home = array_1d(self.num_layers, ValueHolder)
         for j in range(self.num_layers):
-            self.init_weight(j)
+            self.init_weight(j)      # 给weight_home赋值
 
     def delete_all_weights(self):
         for j in range(self.num_layers):
             self.delete_weight(j, 0)
 
     def update_attention_mask(self, i, k):
-        if i > 0:
+        if i > 0:  # decode阶段每次加1
             mask = self.attention_mask[k]
             assert mask.val is not None
             mask.val = mask.val.device.extend_attention_mask(mask.val, [True])
             return
-
+        # prefill阶段，每个批次为每个prompt声明attention mask （batch_size, prompt_len）
         gpu_batch_size = self.policy.gpu_batch_size
         left = k * gpu_batch_size
         right = left + gpu_batch_size
@@ -1012,7 +1037,7 @@ class OptLM:
             self.attention_mask[k].clear()
         self.hidden = array_3d(gen_len, num_layers, num_gpu_batches, ValueHolder)
 
-        # Init cache
+        # Init cache 规定好cache的大小和位置   就是给OptLM中的cache_home赋值，如果是attention层就会多k cache和v cache
         self.set_task(task)
         for j in range(num_layers):
             for k in range(num_gpu_batches):
@@ -1023,7 +1048,7 @@ class OptLM:
         # Generate
         if debug_mode is None:
             if not overlap:
-                # No overlap, easy to understand, suitable for debugging
+                # No overlap, easy to understand, suitable for debugging  具体的prefill＋decode阶段在这个函数里面
                 self.generation_loop_normal()
             else:
                 # Overlap I/O and compute
@@ -1059,7 +1084,7 @@ class OptLM:
                 self.update_attention_mask(i, k)
             for j in range(self.num_layers):
                 for k in range(self.num_gpu_batches):
-                    self.load_weight(i, j, k, overlap=False)
+                    self.load_weight(i, j, k, overlap=False)        # 从weight_home中读取权重到weight_read_buf
 
                 for k in range(self.num_gpu_batches):
                     self.load_cache(i, j, k, overlap=False)
@@ -1366,7 +1391,7 @@ def run_flexgen(args):
     try:
         output_ids = model.generate(
             warmup_inputs, max_new_tokens=1, verbose=args.verbose, warmup=True)
-
+        # 上面是warm-up，下面是正式的生成
         timers("generate").reset()
         output_ids = model.generate(
             inputs, max_new_tokens=args.gen_len,
@@ -1396,15 +1421,18 @@ def run_flexgen(args):
     print("input: " + str(prompt_len) + " output: " + str(gen_len) + " bsz: " + str(num_prompts))
     print("+++++++++++++++++++++++++++++++++++++++++++++++++")
     print("Total: " + str(total_latency) + " Prefill: " + str(prefill_latency) + " Decode: " + str(decode_latency))
+    print("Throughput: " + str(total_throughput) + " Prefill: " + str(prefill_throughput) + " Decode: " + str(decode_throughput))
+    print("GPU peak memory: " + str(gpu_peak_mem))
+    print("CPU peak memory: " + str(cpu_peak_mem))
     print("=================================================")
 
 def add_parser_arguments(parser):
-    parser.add_argument("--model", type=str, default="facebook/opt-6.7b",
+    parser.add_argument("--model", type=str, default="facebook/opt-1.3b",
         help="The model name.")
-    parser.add_argument("--path", type=str, default="~/opt_weights",
+    parser.add_argument("--path", type=str, default="/mnt/sdb/llm_models/opt-1.3b",
         help="The path to the model weights. If there are no cached weights, "
              "FlexGen will automatically download them from HuggingFace.")
-    parser.add_argument("--offload-dir", type=str, default="~/flexgen_offload_dir",
+    parser.add_argument("--offload-dir", type=str, default="/home/szshen/LLM_sparse/InfiniGen/flexgen_offload_dir",
         help="The directory to offload tensors. ")
     parser.add_argument("--prompt-len", type=int, default=512)
     parser.add_argument("--gen-len", type=int, default=32)
